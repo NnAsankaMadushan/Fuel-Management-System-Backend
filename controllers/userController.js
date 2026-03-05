@@ -41,7 +41,7 @@ const signupUser = async (req, res) => {
   try {
     const { name, email, password, role, phoneNumber } = req.body;
     const nicNumber = normalizeNicNumber(req.body.nicNumber);
-    const normalizedRole = normalizeUserRole(role);
+    const normalizedRole = normalizeUserRole(role || "vehicle_owner");
     const mobileClient = isMobileClient(req);
 
     if (!name || !email || !password || !phoneNumber || !nicNumber) {
@@ -72,6 +72,13 @@ const signupUser = async (req, res) => {
       return;
     }
 
+    if (normalizedRole !== "vehicle_owner") {
+      res
+        .status(403)
+        .json({ message: "Only vehicle owner accounts can be created through public signup" });
+      return;
+    }
+
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
@@ -82,6 +89,7 @@ const signupUser = async (req, res) => {
       role: normalizedRole,
       phoneNumber,
       nicNumber,
+      mustChangePassword: false,
     });
 
     await newUser.save();
@@ -100,6 +108,7 @@ const signupUser = async (req, res) => {
         role: normalizeUserRole(newUser.role),
         phoneNumber: newUser.phoneNumber,
         nicNumber: newUser.nicNumber,
+        mustChangePassword: newUser.mustChangePassword,
         ...(mobileClient ? { token } : {}),
       });
     } else {
@@ -113,6 +122,72 @@ const signupUser = async (req, res) => {
 
     res.status(500).json({ message: error.message });
     console.log("Error in signupUser: ", error.message);
+  }
+};
+
+const createStationOwnerByAdmin = async (req, res) => {
+  try {
+    const { name, email, password, phoneNumber } = req.body;
+    const nicNumber = normalizeNicNumber(req.body.nicNumber);
+    const role = "station_owner";
+
+    if (!name || !email || !password || !phoneNumber || !nicNumber) {
+      res.status(400).json({
+        message:
+          "Name, email, password, phone number, and NIC number are required",
+      });
+      return;
+    }
+
+    const [existingEmailUser, existingNicUser] = await Promise.all([
+      User.findOne({ email }),
+      User.findOne({ nicNumber }),
+    ]);
+
+    if (existingEmailUser) {
+      res.status(400).json({ message: "User already exists" });
+      return;
+    }
+
+    if (existingNicUser) {
+      res.status(400).json({ message: "A user with this NIC number already exists" });
+      return;
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    const newUser = new User({
+      name,
+      email,
+      password: hashedPassword,
+      role,
+      phoneNumber,
+      nicNumber,
+      mustChangePassword: true,
+    });
+
+    await newUser.save();
+
+    res.status(201).json({
+      _id: newUser._id,
+      name: newUser.name,
+      email: newUser.email,
+      role: normalizeUserRole(newUser.role),
+      phoneNumber: newUser.phoneNumber,
+      nicNumber: newUser.nicNumber,
+      mustChangePassword: newUser.mustChangePassword,
+      message:
+        "Station owner account created successfully. The user must change the temporary password on first login.",
+    });
+  } catch (error) {
+    if (error?.code === 11000 && error?.keyPattern?.nicNumber) {
+      res.status(400).json({ message: "A user with this NIC number already exists" });
+      return;
+    }
+
+    res.status(500).json({ message: error.message });
+    console.log("Error in createStationOwnerByAdmin: ", error.message);
   }
 };
 
@@ -162,6 +237,7 @@ const loginUser = async (req, res) => {
         role: normalizedRole,
         phoneNumber: user.phoneNumber,
         nicNumber: user.nicNumber,
+        mustChangePassword: Boolean(user.mustChangePassword),
         ...(mobileClient ? { token } : {}),
         ...additionalData,
       });
@@ -238,6 +314,7 @@ const updateUser = async (req, res) => {
         email: user.email,
         phoneNumber: user.phoneNumber,
         nicNumber: user.nicNumber,
+        mustChangePassword: Boolean(user.mustChangePassword),
       },
       message: "User updated successfully",
     });
@@ -249,6 +326,70 @@ const updateUser = async (req, res) => {
 
     res.status(500).json({ message: error.message });
     console.log("Error in updateUser: ", error.message);
+  }
+};
+
+const changePassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    const userId = req.user?._id;
+
+    if (!currentPassword || !newPassword) {
+      res.status(400).json({ message: "Current password and new password are required" });
+      return;
+    }
+
+    if (newPassword.length < 6) {
+      res.status(400).json({ message: "New password must be at least 6 characters long" });
+      return;
+    }
+
+    if (currentPassword === newPassword) {
+      res.status(400).json({ message: "New password must be different from the current password" });
+      return;
+    }
+
+    const user = await User.findById(userId);
+
+    if (!user) {
+      res.status(404).json({ message: "User not found" });
+      return;
+    }
+
+    const isCurrentPasswordCorrect = await bcrypt.compare(currentPassword, user.password);
+
+    if (!isCurrentPasswordCorrect) {
+      res.status(400).json({ message: "Current password is incorrect" });
+      return;
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    user.password = hashedPassword;
+    user.mustChangePassword = false;
+
+    const normalizedRole = normalizeUserRole(user.role);
+    if (normalizedRole !== user.role) {
+      user.role = normalizedRole;
+    }
+
+    await user.save();
+
+    res.status(200).json({
+      message: "Password changed successfully",
+      user: {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        role: normalizeUserRole(user.role),
+        phoneNumber: user.phoneNumber,
+        nicNumber: user.nicNumber,
+        mustChangePassword: Boolean(user.mustChangePassword),
+        ...(await buildStationContext(user._id, normalizeUserRole(user.role))),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+    console.log("Error in changePassword: ", error.message);
   }
 };
 
@@ -286,6 +427,7 @@ const getCurrentUser = async (req, res) => {
       role: normalizeUserRole(user.role),
       phoneNumber: user.phoneNumber,
       nicNumber: user.nicNumber,
+      mustChangePassword: Boolean(user.mustChangePassword),
       ...(await buildStationContext(user._id, normalizeUserRole(user.role))),
     });
   } catch (error) {
@@ -294,4 +436,13 @@ const getCurrentUser = async (req, res) => {
   }
 };
 
-export { signupUser, loginUser, logoutUser, updateUser, getUserProfile, getCurrentUser };
+export {
+  signupUser,
+  createStationOwnerByAdmin,
+  loginUser,
+  logoutUser,
+  updateUser,
+  changePassword,
+  getUserProfile,
+  getCurrentUser,
+};

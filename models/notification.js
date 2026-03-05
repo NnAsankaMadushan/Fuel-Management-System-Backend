@@ -15,7 +15,7 @@ const notificationSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["vehicle_approval"],
+      enum: ["vehicle_approval", "fuel_transaction"],
       default: "vehicle_approval",
     },
     title: {
@@ -30,7 +30,7 @@ const notificationSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["pending", "approved", "rejected"],
+      enum: ["pending", "approved", "rejected", "completed"],
       required: true,
     },
     isRead: {

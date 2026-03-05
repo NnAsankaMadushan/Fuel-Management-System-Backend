@@ -34,6 +34,10 @@ const userSchema = new mongoose.Schema(
       sparse: true,
       set: normalizeNicNumber,
     },
+    mustChangePassword: {
+      type: Boolean,
+      default: false,
+    },
   },
   {
     timestamps: true,

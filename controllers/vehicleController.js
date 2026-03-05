@@ -1,6 +1,5 @@
 import Vehicle from "../models/vehicle.js";
 import VehicleRegistry from "../models/vehicleRegistry.js";
-import Notification from "../models/notification.js";
 import generateQrCode from "../utils/helpers/generateQrCode.js";
 import FuelQuota from "../models/fuelQuota.js";
 import {
@@ -79,43 +78,6 @@ const mapVehicleWithQuota = async (vehicle) => {
     remainingQuota: fuelQuota ? fuelQuota.remainingQuota : 0,
     usedQuota: fuelQuota ? fuelQuota.allocatedQuota - fuelQuota.remainingQuota : 0,
   };
-};
-
-const buildDecisionCopy = (vehicleNumber, status, note) => {
-  const normalizedNote = normalizeApprovalNote(note);
-  const defaultApprovedNote = "Vehicle approved by admin review.";
-  const defaultRejectedNote = "Vehicle rejected by admin review.";
-
-  if (status === "approved") {
-    return {
-      title: "Vehicle approved",
-      message:
-        normalizedNote && normalizedNote !== defaultApprovedNote
-        ? `Your vehicle ${vehicleNumber} has been approved. ${note}`
-        : `Your vehicle ${vehicleNumber} has been approved and can now be used for fuel quota access.`,
-    };
-  }
-
-  return {
-    title: "Vehicle rejected",
-    message:
-      normalizedNote && normalizedNote !== defaultRejectedNote
-      ? `Your vehicle ${vehicleNumber} has been rejected. ${note}`
-      : `Your vehicle ${vehicleNumber} has been rejected by the admin review process.`,
-  };
-};
-
-const createVehicleDecisionNotification = async (vehicle, status, note) => {
-  const notificationCopy = buildDecisionCopy(vehicle.vehicleNumber, status, note);
-
-  await Notification.create({
-    user: vehicle.vehicleOwner?._id || vehicle.vehicleOwner,
-    vehicle: vehicle._id,
-    type: "vehicle_approval",
-    title: notificationCopy.title,
-    message: notificationCopy.message,
-    status,
-  });
 };
 
 const canAccessVehicle = (requestUser, vehicleOwnerId) => {
@@ -373,8 +335,6 @@ const reviewVehicleRegistration = async (req, res) => {
       { $set: { Verified: status === "approved" } }
     );
 
-    await createVehicleDecisionNotification(vehicle, status, nextNote);
-
     const reviewedVehicle = await Vehicle.findById(vehicle._id)
       .populate("vehicleOwner", "name")
       .populate("reviewedBy", "name");
@@ -402,8 +362,6 @@ const deleteVehicle = async (req, res) => {
     }
 
     await FuelQuota.deleteMany({ vehicle: result._id });
-    await Notification.deleteMany({ vehicle: result._id });
-
     res.status(200).json({ message: "Vehicle deleted" });
   } catch (error) {
     res.status(500).json({ message: error.message });

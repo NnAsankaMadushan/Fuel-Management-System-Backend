@@ -232,6 +232,7 @@ const addStationOperator = async (req, res) => {
       role,
       phoneNumber,
       nicNumber,
+      mustChangePassword: true,
     });
 
     await newOperator.save();
@@ -255,6 +256,9 @@ const addStationOperator = async (req, res) => {
         role: newOperator.role,
         phoneNumber: newOperator.phoneNumber,
         nicNumber: newOperator.nicNumber,
+        mustChangePassword: newOperator.mustChangePassword,
+        message:
+          "Operator account created successfully. The user must change the temporary password on first login.",
       });
     } else {
       res.status(400).json({ message: "Invalid user data" });

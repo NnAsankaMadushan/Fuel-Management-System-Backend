@@ -12,6 +12,20 @@ const getRequestToken = (req) => {
   return req.cookies.jwt;
 };
 
+const getRequestPath = (req) =>
+  String(req.originalUrl || req.url || "")
+    .split("?")[0]
+    .trim();
+
+const isPasswordChangeExemptRoute = (req) => {
+  const requestPath = getRequestPath(req);
+
+  return (
+    requestPath.startsWith("/api/users/change-password") ||
+    requestPath.startsWith("/api/users/me")
+  );
+};
+
 const protectRoute = async (req, res, next) => {
   const token = getRequestToken(req);
   if (!token) {
@@ -25,6 +39,14 @@ const protectRoute = async (req, res, next) => {
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
+
+    if (Boolean(user.mustChangePassword) && !isPasswordChangeExemptRoute(req)) {
+      return res.status(403).json({
+        message: "You must change your password before accessing this resource",
+        code: "PASSWORD_CHANGE_REQUIRED",
+      });
+    }
+
     user.role = normalizeUserRole(user.role);
     req.user = user;
 
