@@ -5,14 +5,30 @@ export const generateToken = (userId) =>
     expiresIn: "15d",
   });
 
-export const setAuthCookie = (res, token) => {
+const AUTH_COOKIE_MAX_AGE_MS = 15 * 24 * 60 * 60 * 1000;
+
+const getAuthCookieOptions = ({ includeMaxAge = false } = {}) => {
+  const isProduction = process.env.NODE_ENV === "production";
   const options = {
     httpOnly: true,
-    maxAge: 15 * 24 * 60 * 60 * 1000,
-    sameSite: "strict",
+    sameSite: isProduction ? "none" : "lax",
+    secure: isProduction,
+    path: "/",
   };
 
-  res.cookie("jwt", token, options);
+  if (includeMaxAge) {
+    options.maxAge = AUTH_COOKIE_MAX_AGE_MS;
+  }
+
+  return options;
+};
+
+export const setAuthCookie = (res, token) => {
+  res.cookie("jwt", token, getAuthCookieOptions({ includeMaxAge: true }));
+};
+
+export const clearAuthCookie = (res) => {
+  res.clearCookie("jwt", getAuthCookieOptions());
 };
 
 const generateTokenAndSetCookie = (userId, res) => {

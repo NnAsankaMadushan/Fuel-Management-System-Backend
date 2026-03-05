@@ -1,6 +1,7 @@
 import User from "../models/user.js";
 import bcrypt from "bcryptjs";
 import {
+  clearAuthCookie,
   generateToken,
   setAuthCookie,
 } from "../utils/helpers/genarateTokenAndSetCookie.js";
@@ -176,7 +177,7 @@ const loginUser = async (req, res) => {
 // Logout a user
 const logoutUser = async (req, res) => {
   try {
-    res.cookie("jwt", "", { maxAge: 1 });
+    clearAuthCookie(res);
     res.status(200).json({ message: "User logged out" });
   } catch (error) {
     res.status(500).json({ message: error.message });
