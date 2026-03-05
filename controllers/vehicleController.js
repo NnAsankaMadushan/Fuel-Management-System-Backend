@@ -235,6 +235,7 @@ const registerVehicle = async (req, res) => {
 const getAllVehicles = async (req, res) => {
   try {
     const vehicles = await Vehicle.find({})
+      .sort({ createdAt: -1, _id: -1 })
       .select("-updatedAt -qrCode")
       .populate("vehicleOwner", "name");
 

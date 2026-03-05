@@ -183,6 +183,7 @@ const getStationById = async (req, res) => {
 const getAllStations = async (req, res) => {
   try {
     const stations = await FuelStation.find({})
+      .sort({ createdAt: -1, _id: -1 })
       .populate("fuelStationOwner", "name email")
       .populate("stationOperators", "name email phoneNumber nicNumber role")
       .populate(`registeredVehicles.vehicle`, "vehicleNumber vehicleType");
