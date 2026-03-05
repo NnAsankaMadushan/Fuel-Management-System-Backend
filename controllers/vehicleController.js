@@ -155,7 +155,7 @@ const registerVehicle = async (req, res) => {
       return;
     }
 
-    if (req.user.role !== "vehicle_owner") {
+    if (!["vehicle_owner", "station_operator"].includes(req.user.role)) {
       res.status(400).json({ message: "Unauthorized" });
       return;
     }

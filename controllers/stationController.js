@@ -1,6 +1,7 @@
 import FuelStation from "../models/fuelStation.js";
 import User from "../models/user.js";
 import bcrypt from "bcryptjs";
+import { normalizeNicNumber } from "../utils/helpers/normalizeNicNumber.js";
 
 // import { protectRoute, authorizeRole } from "../middleware/protectRoute.js"; // Import protectRoute and authorizeRole middleware
 
@@ -165,7 +166,7 @@ const getStationById = async (req, res) => {
   try {
     const station = await FuelStation.findById(stationId)
       .populate("fuelStationOwner", "name email")
-      .populate("stationOperators", "name email phoneNumber role")
+      .populate("stationOperators", "name email phoneNumber nicNumber role")
       .populate(`registeredVehicles.vehicle`, "vehicleNumber vehicleType");
     if (!station) {
       return res.status(404).json({ message: "Station not found" });
@@ -183,7 +184,7 @@ const getAllStations = async (req, res) => {
   try {
     const stations = await FuelStation.find({})
       .populate("fuelStationOwner", "name email")
-      .populate("stationOperators", "name email phoneNumber role")
+      .populate("stationOperators", "name email phoneNumber nicNumber role")
       .populate(`registeredVehicles.vehicle`, "vehicleNumber vehicleType");
     res.status(200).json(stations);
   } catch (error) {
@@ -195,7 +196,15 @@ const getAllStations = async (req, res) => {
 const addStationOperator = async (req, res) => {
   try {
     const { name, email, password, phoneNumber } = req.body;
+    const nicNumber = normalizeNicNumber(req.body.nicNumber);
     const role = "station_operator";
+
+    if (!name || !email || !password || !phoneNumber || !nicNumber) {
+      return res.status(400).json({
+        message:
+          "Name, email, password, phone number, and NIC number are required",
+      });
+    }
 
     const user = req.user;
     if (user.role !== "station_owner") {
@@ -209,6 +218,11 @@ const addStationOperator = async (req, res) => {
       return res.status(400).json({ message: "User already exists" });
     }
 
+    const existingNic = await User.findOne({ nicNumber });
+    if (existingNic) {
+      return res.status(400).json({ message: "A user with this NIC number already exists" });
+    }
+
     const hashedPassword = await bcrypt.hash(password, 10);
 
     const newOperator = new User({
@@ -217,6 +231,7 @@ const addStationOperator = async (req, res) => {
       password: hashedPassword,
       role,
       phoneNumber,
+      nicNumber,
     });
 
     await newOperator.save();
@@ -239,11 +254,17 @@ const addStationOperator = async (req, res) => {
         email: newOperator.email,
         role: newOperator.role,
         phoneNumber: newOperator.phoneNumber,
+        nicNumber: newOperator.nicNumber,
       });
     } else {
       res.status(400).json({ message: "Invalid user data" });
     }
   } catch (error) {
+    if (error?.code === 11000 && error?.keyPattern?.nicNumber) {
+      res.status(400).json({ message: "A user with this NIC number already exists" });
+      return;
+    }
+
     res.status(500).json({ message: error.message });
     console.log("Error in addStationOperator: ", error.message);
   }
@@ -337,7 +358,7 @@ const getAllStaionsByUserId = async (req, res) => {
     const user = req.user;
     const stations = await FuelStation.find({ fuelStationOwner: user._id })
       .populate("fuelStationOwner", "name email")
-      .populate("stationOperators", "name email phoneNumber role")
+      .populate("stationOperators", "name email phoneNumber nicNumber role")
       .populate(`registeredVehicles.vehicle`, "vehicleNumber vehicleType");
     res.status(200).json(stations);
   } catch (error) {

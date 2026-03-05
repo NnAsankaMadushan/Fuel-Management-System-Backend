@@ -10,6 +10,7 @@ import {
   isSupportedUserRole,
   normalizeUserRole,
 } from "../utils/helpers/normalizeUserRole.js";
+import { normalizeNicNumber } from "../utils/helpers/normalizeNicNumber.js";
 
 const isMobileClient = (req) => req.get("X-Client-Platform") === "mobile";
 
@@ -38,11 +39,30 @@ const buildStationContext = async (userId, role) => {
 const signupUser = async (req, res) => {
   try {
     const { name, email, password, role, phoneNumber } = req.body;
+    const nicNumber = normalizeNicNumber(req.body.nicNumber);
     const normalizedRole = normalizeUserRole(role);
     const mobileClient = isMobileClient(req);
-    const user = await User.findOne({ email });
-    if (user) {
+
+    if (!name || !email || !password || !phoneNumber || !nicNumber) {
+      res.status(400).json({
+        message:
+          "Name, email, password, phone number, and NIC number are required",
+      });
+      return;
+    }
+
+    const [existingEmailUser, existingNicUser] = await Promise.all([
+      User.findOne({ email }),
+      User.findOne({ nicNumber }),
+    ]);
+
+    if (existingEmailUser) {
       res.status(400).json({ message: "User already exists" });
+      return;
+    }
+
+    if (existingNicUser) {
+      res.status(400).json({ message: "A user with this NIC number already exists" });
       return;
     }
 
@@ -60,6 +80,7 @@ const signupUser = async (req, res) => {
       password: hashedPassword,
       role: normalizedRole,
       phoneNumber,
+      nicNumber,
     });
 
     await newUser.save();
@@ -77,12 +98,18 @@ const signupUser = async (req, res) => {
         email: newUser.email,
         role: normalizeUserRole(newUser.role),
         phoneNumber: newUser.phoneNumber,
+        nicNumber: newUser.nicNumber,
         ...(mobileClient ? { token } : {}),
       });
     } else {
       res.status(400).json({ message: "Invalid user data" });
     }
   } catch (error) {
+    if (error?.code === 11000 && error?.keyPattern?.nicNumber) {
+      res.status(400).json({ message: "A user with this NIC number already exists" });
+      return;
+    }
+
     res.status(500).json({ message: error.message });
     console.log("Error in signupUser: ", error.message);
   }
@@ -133,6 +160,7 @@ const loginUser = async (req, res) => {
         email: user.email,
         role: normalizedRole,
         phoneNumber: user.phoneNumber,
+        nicNumber: user.nicNumber,
         ...(mobileClient ? { token } : {}),
         ...additionalData,
       });
@@ -159,6 +187,11 @@ const logoutUser = async (req, res) => {
 //Update a user
 const updateUser = async (req, res) => {
   const { name, email, phoneNumber } = req.body;
+  const nicNumberInputProvided = Object.prototype.hasOwnProperty.call(
+    req.body,
+    "nicNumber"
+  );
+  const nicNumber = normalizeNicNumber(req.body.nicNumber);
   const userId = req.user._id;
   try {
     let user = await User.findById(userId);
@@ -175,6 +208,26 @@ const updateUser = async (req, res) => {
     user.name = name || user.name;
     user.email = email || user.email;
     user.phoneNumber = phoneNumber || user.phoneNumber;
+
+    if (nicNumberInputProvided) {
+      if (!nicNumber) {
+        res.status(400).json({ message: "NIC number cannot be empty" });
+        return;
+      }
+
+      const duplicateNicUser = await User.findOne({
+        nicNumber,
+        _id: { $ne: userId },
+      });
+
+      if (duplicateNicUser) {
+        res.status(400).json({ message: "A user with this NIC number already exists" });
+        return;
+      }
+
+      user.nicNumber = nicNumber;
+    }
+
     user = await user.save();
 
     res.status(200).json({
@@ -183,10 +236,16 @@ const updateUser = async (req, res) => {
         name: user.name,
         email: user.email,
         phoneNumber: user.phoneNumber,
+        nicNumber: user.nicNumber,
       },
       message: "User updated successfully",
     });
   } catch (error) {
+    if (error?.code === 11000 && error?.keyPattern?.nicNumber) {
+      res.status(400).json({ message: "A user with this NIC number already exists" });
+      return;
+    }
+
     res.status(500).json({ message: error.message });
     console.log("Error in updateUser: ", error.message);
   }
@@ -225,6 +284,7 @@ const getCurrentUser = async (req, res) => {
       email: user.email,
       role: normalizeUserRole(user.role),
       phoneNumber: user.phoneNumber,
+      nicNumber: user.nicNumber,
       ...(await buildStationContext(user._id, normalizeUserRole(user.role))),
     });
   } catch (error) {
