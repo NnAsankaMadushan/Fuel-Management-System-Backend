@@ -1,4 +1,3 @@
-// Qr code generator helper function
 import QRCode from "qrcode";
 
 export const generateQrCode = async (text) => {
