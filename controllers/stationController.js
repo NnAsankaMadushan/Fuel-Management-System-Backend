@@ -233,6 +233,7 @@ const addStationOperator = async (req, res) => {
       role,
       phoneNumber,
       nicNumber,
+      emailVerified: true,
       mustChangePassword: true,
     });
 
@@ -258,6 +259,7 @@ const addStationOperator = async (req, res) => {
         phoneNumber: newOperator.phoneNumber,
         nicNumber: newOperator.nicNumber,
         mustChangePassword: newOperator.mustChangePassword,
+        emailVerified: Boolean(newOperator.emailVerified),
         message:
           "Operator account created successfully. The user must change the temporary password on first login.",
       });

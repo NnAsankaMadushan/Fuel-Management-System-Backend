@@ -1,5 +1,7 @@
-import User from "../models/user.js";
 import bcrypt from "bcryptjs";
+import crypto from "crypto";
+import User from "../models/user.js";
+import PendingSignup from "../models/pendingSignup.js";
 import {
   clearAuthCookie,
   generateToken,
@@ -12,8 +14,150 @@ import {
   normalizeUserRole,
 } from "../utils/helpers/normalizeUserRole.js";
 import { normalizeNicNumber } from "../utils/helpers/normalizeNicNumber.js";
+import sendEmail from "../utils/helpers/sendEmail.js";
+
+const EMAIL_OTP_EXPIRY_MINUTES = 10;
+const EMAIL_OTP_RESEND_COOLDOWN_SECONDS = 60;
+const EMAIL_OTP_REGEX = /^[0-9]{6}$/;
 
 const isMobileClient = (req) => req.get("X-Client-Platform") === "mobile";
+const isEmailOtpDebugEnabled = () =>
+  process.env.EMAIL_OTP_DEBUG === "true" &&
+  process.env.NODE_ENV !== "production";
+
+const generateEmailVerificationOtp = () =>
+  crypto.randomInt(100000, 1000000).toString();
+
+const hashEmailVerificationOtp = (otp) =>
+  crypto.createHash("sha256").update(String(otp)).digest("hex");
+
+const getOtpRetryAfterSeconds = (sentAt) => {
+  if (!sentAt) {
+    return 0;
+  }
+
+  const elapsedSeconds = Math.floor(
+    (Date.now() - new Date(sentAt).getTime()) / 1000
+  );
+
+  return Math.max(0, EMAIL_OTP_RESEND_COOLDOWN_SECONDS - elapsedSeconds);
+};
+
+const buildEmailVerificationContent = (otp, recipientName = "") => {
+  const greeting = recipientName ? `Hi ${recipientName},` : "Hi,";
+  const subject = "FuelPlus Email Verification OTP";
+  const text = `${greeting}
+Use the OTP below to verify your FuelPlus account:
+
+${otp}
+
+This OTP will expire in ${EMAIL_OTP_EXPIRY_MINUTES} minutes.
+If you did not request this, please ignore this email.`;
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; line-height: 1.5; color: #1f2937;">
+      <p>${greeting}</p>
+      <p>Use the OTP below to verify your FuelPlus account:</p>
+      <p style="font-size: 24px; font-weight: 700; letter-spacing: 4px; margin: 16px 0;">${otp}</p>
+      <p>This OTP will expire in ${EMAIL_OTP_EXPIRY_MINUTES} minutes.</p>
+      <p>If you did not request this, please ignore this email.</p>
+    </div>
+  `;
+
+  return { subject, text, html };
+};
+
+const buildSignupOtpContent = (otp, recipientName = "") => {
+  const greeting = recipientName ? `Hi ${recipientName},` : "Hi,";
+  const subject = "FuelPlus Signup OTP";
+  const text = `${greeting}
+Use the OTP below to confirm your FuelPlus signup:
+
+${otp}
+
+This OTP will expire in ${EMAIL_OTP_EXPIRY_MINUTES} minutes.
+Your account will be created only after OTP verification.`;
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; line-height: 1.5; color: #1f2937;">
+      <p>${greeting}</p>
+      <p>Use the OTP below to confirm your FuelPlus signup:</p>
+      <p style="font-size: 24px; font-weight: 700; letter-spacing: 4px; margin: 16px 0;">${otp}</p>
+      <p>This OTP will expire in ${EMAIL_OTP_EXPIRY_MINUTES} minutes.</p>
+      <p>Your account will be created only after OTP verification.</p>
+    </div>
+  `;
+
+  return { subject, text, html };
+};
+
+const issueSignupOtp = async (pendingSignup, { enforceCooldown = true } = {}) => {
+  const retryAfterSeconds = getOtpRetryAfterSeconds(pendingSignup.signupOtpSentAt);
+
+  if (enforceCooldown && retryAfterSeconds > 0) {
+    return {
+      sent: false,
+      throttled: true,
+      retryAfterSeconds,
+    };
+  }
+
+  const otp = generateEmailVerificationOtp();
+  const expiresAt = new Date(Date.now() + EMAIL_OTP_EXPIRY_MINUTES * 60 * 1000);
+
+  pendingSignup.signupOtpHash = hashEmailVerificationOtp(otp);
+  pendingSignup.signupOtpExpiresAt = expiresAt;
+  pendingSignup.signupOtpSentAt = new Date();
+  await pendingSignup.save();
+
+  const emailContent = buildSignupOtpContent(otp, pendingSignup.name);
+  const emailResult = await sendEmail({
+    to: pendingSignup.email,
+    ...emailContent,
+  });
+
+  return {
+    sent: Boolean(emailResult?.delivered),
+    throttled: false,
+    retryAfterSeconds: EMAIL_OTP_RESEND_COOLDOWN_SECONDS,
+    debugOtp: isEmailOtpDebugEnabled() ? otp : undefined,
+    deliveryReason: emailResult?.reason || "",
+  };
+};
+
+const issueEmailVerificationOtp = async (user, { enforceCooldown = true } = {}) => {
+  const retryAfterSeconds = getOtpRetryAfterSeconds(user.emailVerificationOtpSentAt);
+
+  if (enforceCooldown && retryAfterSeconds > 0) {
+    return {
+      sent: false,
+      throttled: true,
+      retryAfterSeconds,
+    };
+  }
+
+  const otp = generateEmailVerificationOtp();
+  const expiresAt = new Date(Date.now() + EMAIL_OTP_EXPIRY_MINUTES * 60 * 1000);
+
+  user.emailVerificationOtpHash = hashEmailVerificationOtp(otp);
+  user.emailVerificationOtpExpiresAt = expiresAt;
+  user.emailVerificationOtpSentAt = new Date();
+  await user.save();
+
+  const emailContent = buildEmailVerificationContent(otp, user.name);
+  const emailResult = await sendEmail({
+    to: user.email,
+    ...emailContent,
+  });
+
+  return {
+    sent: Boolean(emailResult?.delivered),
+    throttled: false,
+    retryAfterSeconds: EMAIL_OTP_RESEND_COOLDOWN_SECONDS,
+    debugOtp: isEmailOtpDebugEnabled() ? otp : undefined,
+    deliveryReason: emailResult?.reason || "",
+  };
+};
 
 const buildStationContext = async (userId, role) => {
   if (role !== "station_owner" && role !== "station_operator") {
@@ -42,28 +186,12 @@ const signupUser = async (req, res) => {
     const { name, email, password, role, phoneNumber } = req.body;
     const nicNumber = normalizeNicNumber(req.body.nicNumber);
     const normalizedRole = normalizeUserRole(role || "vehicle_owner");
-    const mobileClient = isMobileClient(req);
 
     if (!name || !email || !password || !phoneNumber || !nicNumber) {
       res.status(400).json({
         message:
           "Name, email, password, phone number, and NIC number are required",
       });
-      return;
-    }
-
-    const [existingEmailUser, existingNicUser] = await Promise.all([
-      User.findOne({ email }),
-      User.findOne({ nicNumber }),
-    ]);
-
-    if (existingEmailUser) {
-      res.status(400).json({ message: "User already exists" });
-      return;
-    }
-
-    if (existingNicUser) {
-      res.status(400).json({ message: "A user with this NIC number already exists" });
       return;
     }
 
@@ -79,49 +207,243 @@ const signupUser = async (req, res) => {
       return;
     }
 
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
+    const [existingEmailUser, existingNicUser, pendingSignupByEmail] = await Promise.all([
+      User.findOne({ email }),
+      User.findOne({ nicNumber }),
+      PendingSignup.findOne({ email }).select(
+        "+passwordHash +signupOtpHash +signupOtpExpiresAt +signupOtpSentAt"
+      ),
+    ]);
+
+    if (existingEmailUser) {
+      res.status(400).json({ message: "User already exists" });
+      return;
+    }
+
+    if (existingNicUser) {
+      res.status(400).json({ message: "A user with this NIC number already exists" });
+      return;
+    }
+
+    const duplicatePendingNic = await PendingSignup.findOne({
+      nicNumber,
+      ...(pendingSignupByEmail ? { _id: { $ne: pendingSignupByEmail._id } } : {}),
+    });
+
+    if (duplicatePendingNic) {
+      res.status(400).json({
+        message: "A pending signup with this NIC number already exists",
+      });
+      return;
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const pendingSignup = pendingSignupByEmail || new PendingSignup();
+
+    pendingSignup.name = name;
+    pendingSignup.email = email;
+    pendingSignup.passwordHash = hashedPassword;
+    pendingSignup.role = normalizedRole;
+    pendingSignup.phoneNumber = phoneNumber;
+    pendingSignup.nicNumber = nicNumber;
+
+    const otpDispatchResult = await issueSignupOtp(pendingSignup, {
+      enforceCooldown: Boolean(pendingSignupByEmail),
+    });
+
+    if (otpDispatchResult.throttled) {
+      res.status(429).json({
+        message: `Please wait ${otpDispatchResult.retryAfterSeconds} seconds before requesting a new OTP`,
+        retryAfterSeconds: otpDispatchResult.retryAfterSeconds,
+      });
+      return;
+    }
+
+    res.status(pendingSignupByEmail ? 200 : 201).json({
+      email: pendingSignup.email,
+      name: pendingSignup.name,
+      requiresEmailVerification: true,
+      otpDeliveryStatus: otpDispatchResult.sent ? "sent" : "failed",
+      message: otpDispatchResult.sent
+        ? "OTP has been sent to your email. Verify OTP to complete account creation."
+        : "OTP generated, but email delivery failed. Please retry sending OTP.",
+      ...(otpDispatchResult.debugOtp
+        ? { debugOtp: otpDispatchResult.debugOtp }
+        : {}),
+    });
+  } catch (error) {
+    if (
+      error?.code === 11000 &&
+      (error?.keyPattern?.nicNumber || error?.keyPattern?.email)
+    ) {
+      res.status(400).json({
+        message:
+          error?.keyPattern?.email
+            ? "A pending signup with this email already exists"
+            : "A pending signup with this NIC number already exists",
+      });
+      return;
+    }
+
+    res.status(500).json({ message: error.message });
+    console.log("Error in signupUser: ", error.message);
+  }
+};
+
+const resendSignupOtp = async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim();
+
+    if (!email) {
+      res.status(400).json({ message: "Email is required" });
+      return;
+    }
+
+    const [pendingSignup, existingUser] = await Promise.all([
+      PendingSignup.findOne({ email }).select(
+        "+signupOtpHash +signupOtpExpiresAt +signupOtpSentAt"
+      ),
+      User.findOne({ email }),
+    ]);
+
+    if (existingUser) {
+      res.status(400).json({
+        message: "Account already exists for this email. Please login.",
+      });
+      return;
+    }
+
+    if (!pendingSignup) {
+      res.status(404).json({
+        message: "No pending signup found for this email. Please signup again.",
+      });
+      return;
+    }
+
+    const otpDispatchResult = await issueSignupOtp(pendingSignup, {
+      enforceCooldown: true,
+    });
+
+    if (otpDispatchResult.throttled) {
+      res.status(429).json({
+        message: `Please wait ${otpDispatchResult.retryAfterSeconds} seconds before requesting a new OTP`,
+        retryAfterSeconds: otpDispatchResult.retryAfterSeconds,
+      });
+      return;
+    }
+
+    res.status(200).json({
+      message: otpDispatchResult.sent
+        ? "A new OTP has been sent."
+        : "OTP generated, but email delivery failed. Please retry after SMTP is available.",
+      otpDeliveryStatus: otpDispatchResult.sent ? "sent" : "failed",
+      ...(otpDispatchResult.debugOtp
+        ? { debugOtp: otpDispatchResult.debugOtp }
+        : {}),
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+    console.log("Error in resendSignupOtp: ", error.message);
+  }
+};
+
+const confirmSignupUser = async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim();
+    const otp = String(req.body?.otp || "").trim();
+
+    if (!email || !otp) {
+      res.status(400).json({ message: "Email and OTP are required" });
+      return;
+    }
+
+    if (!EMAIL_OTP_REGEX.test(otp)) {
+      res.status(400).json({ message: "OTP must be a 6-digit code" });
+      return;
+    }
+
+    const pendingSignup = await PendingSignup.findOne({ email }).select(
+      "+passwordHash +signupOtpHash +signupOtpExpiresAt +signupOtpSentAt"
+    );
+
+    if (!pendingSignup) {
+      res.status(404).json({
+        message: "No pending signup found for this email. Please signup again.",
+      });
+      return;
+    }
+
+    if (
+      !pendingSignup.signupOtpHash ||
+      !pendingSignup.signupOtpExpiresAt
+    ) {
+      res.status(400).json({
+        message: "No active OTP found. Please request a new OTP.",
+      });
+      return;
+    }
+
+    if (new Date(pendingSignup.signupOtpExpiresAt).getTime() < Date.now()) {
+      res.status(400).json({
+        message: "OTP has expired. Please request a new OTP.",
+      });
+      return;
+    }
+
+    const incomingOtpHash = hashEmailVerificationOtp(otp);
+    if (incomingOtpHash !== pendingSignup.signupOtpHash) {
+      res.status(400).json({ message: "Invalid OTP" });
+      return;
+    }
+
+    const [existingEmailUser, existingNicUser] = await Promise.all([
+      User.findOne({ email: pendingSignup.email }),
+      User.findOne({ nicNumber: pendingSignup.nicNumber }),
+    ]);
+
+    if (existingEmailUser || existingNicUser) {
+      await PendingSignup.deleteOne({ _id: pendingSignup._id });
+      res.status(400).json({
+        message:
+          existingEmailUser
+            ? "User already exists"
+            : "A user with this NIC number already exists",
+      });
+      return;
+    }
 
     const newUser = new User({
-      name,
-      email,
-      password: hashedPassword,
-      role: normalizedRole,
-      phoneNumber,
-      nicNumber,
+      name: pendingSignup.name,
+      email: pendingSignup.email,
+      password: pendingSignup.passwordHash,
+      role: normalizeUserRole(pendingSignup.role || "vehicle_owner"),
+      phoneNumber: pendingSignup.phoneNumber,
+      nicNumber: pendingSignup.nicNumber,
+      emailVerified: true,
       mustChangePassword: false,
     });
 
     await newUser.save();
+    await PendingSignup.deleteOne({ _id: pendingSignup._id });
 
-    if (newUser) {
-      const token = generateToken(newUser._id);
-
-      if (!mobileClient) {
-        setAuthCookie(res, token);
-      }
-
-      res.status(201).json({
-        _id: newUser._id,
-        name: newUser.name,
-        email: newUser.email,
-        role: normalizeUserRole(newUser.role),
-        phoneNumber: newUser.phoneNumber,
-        nicNumber: newUser.nicNumber,
-        mustChangePassword: newUser.mustChangePassword,
-        ...(mobileClient ? { token } : {}),
-      });
-    } else {
-      res.status(400).json({ message: "Invalid user data" });
-    }
+    res.status(201).json({
+      message: "Email verified successfully. Account created. You can now log in.",
+      emailVerified: true,
+      email: newUser.email,
+    });
   } catch (error) {
     if (error?.code === 11000 && error?.keyPattern?.nicNumber) {
       res.status(400).json({ message: "A user with this NIC number already exists" });
       return;
     }
 
+    if (error?.code === 11000 && error?.keyPattern?.email) {
+      res.status(400).json({ message: "User already exists" });
+      return;
+    }
+
     res.status(500).json({ message: error.message });
-    console.log("Error in signupUser: ", error.message);
+    console.log("Error in confirmSignupUser: ", error.message);
   }
 };
 
@@ -164,6 +486,7 @@ const createStationOwnerByAdmin = async (req, res) => {
       role,
       phoneNumber,
       nicNumber,
+      emailVerified: true,
       mustChangePassword: true,
     });
 
@@ -177,6 +500,7 @@ const createStationOwnerByAdmin = async (req, res) => {
       phoneNumber: newUser.phoneNumber,
       nicNumber: newUser.nicNumber,
       mustChangePassword: newUser.mustChangePassword,
+      emailVerified: Boolean(newUser.emailVerified),
       message:
         "Station owner account created successfully. The user must change the temporary password on first login.",
     });
@@ -206,6 +530,16 @@ const loginUser = async (req, res) => {
       if (normalizedRole !== user.role) {
         user.role = normalizedRole;
         await user.save();
+      }
+
+      if (user.emailVerified === false) {
+        res.status(403).json({
+          message:
+            "Email is not verified. Please verify your email using OTP before logging in.",
+          code: "EMAIL_NOT_VERIFIED",
+          email: user.email,
+        });
+        return;
       }
 
       const token = generateToken(user._id);
@@ -238,6 +572,7 @@ const loginUser = async (req, res) => {
         phoneNumber: user.phoneNumber,
         nicNumber: user.nicNumber,
         mustChangePassword: Boolean(user.mustChangePassword),
+        emailVerified: user.emailVerified !== false,
         ...(mobileClient ? { token } : {}),
         ...additionalData,
       });
@@ -268,8 +603,11 @@ const updateUser = async (req, res) => {
     req.body,
     "nicNumber"
   );
+  const emailInputProvided = Object.prototype.hasOwnProperty.call(req.body, "email");
+  const nextEmail = typeof email === "string" ? email.trim() : "";
   const nicNumber = normalizeNicNumber(req.body.nicNumber);
   const userId = req.user._id;
+
   try {
     let user = await User.findById(userId);
     if (!user) {
@@ -282,9 +620,33 @@ const updateUser = async (req, res) => {
       return;
     }
 
+    let emailChanged = false;
+
     user.name = name || user.name;
-    user.email = email || user.email;
     user.phoneNumber = phoneNumber || user.phoneNumber;
+
+    if (emailInputProvided) {
+      if (!nextEmail) {
+        res.status(400).json({ message: "Email cannot be empty" });
+        return;
+      }
+
+      const duplicateEmailUser = await User.findOne({
+        email: nextEmail,
+        _id: { $ne: userId },
+      });
+
+      if (duplicateEmailUser) {
+        res.status(400).json({ message: "User already exists" });
+        return;
+      }
+
+      if (nextEmail !== user.email) {
+        user.email = nextEmail;
+        user.emailVerified = false;
+        emailChanged = true;
+      }
+    }
 
     if (nicNumberInputProvided) {
       if (!nicNumber) {
@@ -306,6 +668,13 @@ const updateUser = async (req, res) => {
     }
 
     user = await user.save();
+    let otpDispatchResult;
+
+    if (emailChanged) {
+      otpDispatchResult = await issueEmailVerificationOtp(user, {
+        enforceCooldown: false,
+      });
+    }
 
     res.status(200).json({
       user: {
@@ -315,8 +684,16 @@ const updateUser = async (req, res) => {
         phoneNumber: user.phoneNumber,
         nicNumber: user.nicNumber,
         mustChangePassword: Boolean(user.mustChangePassword),
+        emailVerified: user.emailVerified !== false,
       },
-      message: "User updated successfully",
+      message: emailChanged
+        ? otpDispatchResult?.sent
+          ? "User updated successfully. Verification OTP has been sent to your new email."
+          : "User updated successfully, but OTP email delivery failed. Request another OTP to verify your email."
+        : "User updated successfully",
+      ...(otpDispatchResult?.debugOtp
+        ? { debugOtp: otpDispatchResult.debugOtp }
+        : {}),
     });
   } catch (error) {
     if (error?.code === 11000 && error?.keyPattern?.nicNumber) {
@@ -384,6 +761,7 @@ const changePassword = async (req, res) => {
         phoneNumber: user.phoneNumber,
         nicNumber: user.nicNumber,
         mustChangePassword: Boolean(user.mustChangePassword),
+        emailVerified: user.emailVerified !== false,
         ...(await buildStationContext(user._id, normalizeUserRole(user.role))),
       },
     });
@@ -428,6 +806,7 @@ const getCurrentUser = async (req, res) => {
       phoneNumber: user.phoneNumber,
       nicNumber: user.nicNumber,
       mustChangePassword: Boolean(user.mustChangePassword),
+      emailVerified: user.emailVerified !== false,
       ...(await buildStationContext(user._id, normalizeUserRole(user.role))),
     });
   } catch (error) {
@@ -436,9 +815,139 @@ const getCurrentUser = async (req, res) => {
   }
 };
 
+const requestEmailVerificationOtp = async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim();
+
+    if (!email) {
+      res.status(400).json({ message: "Email is required" });
+      return;
+    }
+
+    const user = await User.findOne({ email }).select(
+      "+emailVerificationOtpHash +emailVerificationOtpExpiresAt +emailVerificationOtpSentAt"
+    );
+
+    if (!user) {
+      res.status(404).json({ message: "User not found" });
+      return;
+    }
+
+    if (user.emailVerified !== false) {
+      res.status(200).json({
+        message: "Email is already verified",
+        emailVerified: true,
+      });
+      return;
+    }
+
+    const otpDispatchResult = await issueEmailVerificationOtp(user, {
+      enforceCooldown: true,
+    });
+
+    if (otpDispatchResult.throttled) {
+      res.status(429).json({
+        message: `Please wait ${otpDispatchResult.retryAfterSeconds} seconds before requesting a new OTP`,
+        retryAfterSeconds: otpDispatchResult.retryAfterSeconds,
+      });
+      return;
+    }
+
+    res.status(200).json({
+      message: otpDispatchResult.sent
+        ? "Verification OTP has been sent to your email"
+        : "OTP generated, but email delivery failed. Please retry after SMTP is available.",
+      emailVerified: false,
+      otpDeliveryStatus: otpDispatchResult.sent ? "sent" : "failed",
+      ...(otpDispatchResult.debugOtp
+        ? { debugOtp: otpDispatchResult.debugOtp }
+        : {}),
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+    console.log("Error in requestEmailVerificationOtp: ", error.message);
+  }
+};
+
+const verifyEmailVerificationOtp = async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim();
+    const otp = String(req.body?.otp || "").trim();
+
+    if (!email || !otp) {
+      res.status(400).json({ message: "Email and OTP are required" });
+      return;
+    }
+
+    if (!EMAIL_OTP_REGEX.test(otp)) {
+      res.status(400).json({ message: "OTP must be a 6-digit code" });
+      return;
+    }
+
+    const user = await User.findOne({ email }).select(
+      "+emailVerificationOtpHash +emailVerificationOtpExpiresAt +emailVerificationOtpSentAt"
+    );
+
+    if (!user) {
+      res.status(404).json({ message: "User not found" });
+      return;
+    }
+
+    if (user.emailVerified !== false) {
+      res.status(200).json({
+        message: "Email is already verified",
+        emailVerified: true,
+      });
+      return;
+    }
+
+    if (!user.emailVerificationOtpHash || !user.emailVerificationOtpExpiresAt) {
+      res.status(400).json({
+        message: "No active OTP found. Please request a new OTP.",
+      });
+      return;
+    }
+
+    if (new Date(user.emailVerificationOtpExpiresAt).getTime() < Date.now()) {
+      user.emailVerificationOtpHash = undefined;
+      user.emailVerificationOtpExpiresAt = undefined;
+      user.emailVerificationOtpSentAt = undefined;
+      await user.save();
+
+      res.status(400).json({ message: "OTP has expired. Please request a new OTP." });
+      return;
+    }
+
+    const incomingOtpHash = hashEmailVerificationOtp(otp);
+    if (incomingOtpHash !== user.emailVerificationOtpHash) {
+      res.status(400).json({ message: "Invalid OTP" });
+      return;
+    }
+
+    user.emailVerified = true;
+    user.emailVerificationOtpHash = undefined;
+    user.emailVerificationOtpExpiresAt = undefined;
+    user.emailVerificationOtpSentAt = undefined;
+    await user.save();
+
+    res.status(200).json({
+      message: "Email verified successfully. You can now log in.",
+      emailVerified: true,
+      email: user.email,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+    console.log("Error in verifyEmailVerificationOtp: ", error.message);
+  }
+};
+
 export {
   signupUser,
+  resendSignupOtp,
+  confirmSignupUser,
   createStationOwnerByAdmin,
+  requestEmailVerificationOtp,
+  verifyEmailVerificationOtp,
   loginUser,
   logoutUser,
   updateUser,

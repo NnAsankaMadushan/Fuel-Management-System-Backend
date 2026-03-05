@@ -1,8 +1,11 @@
 import mongoose from "mongoose";
-import { normalizeUserRole, USER_ROLES } from "../utils/helpers/normalizeUserRole.js";
 import { normalizeNicNumber } from "../utils/helpers/normalizeNicNumber.js";
+import {
+  normalizeUserRole,
+  USER_ROLES,
+} from "../utils/helpers/normalizeUserRole.js";
 
-const userSchema = new mongoose.Schema(
+const pendingSignupSchema = new mongoose.Schema(
   {
     name: {
       type: String,
@@ -13,25 +16,10 @@ const userSchema = new mongoose.Schema(
       required: true,
       unique: true,
     },
-    emailVerified: {
-      type: Boolean,
-      default: false,
-    },
-    emailVerificationOtpHash: {
-      type: String,
-      select: false,
-    },
-    emailVerificationOtpExpiresAt: {
-      type: Date,
-      select: false,
-    },
-    emailVerificationOtpSentAt: {
-      type: Date,
-      select: false,
-    },
-    password: {
+    passwordHash: {
       type: String,
       required: true,
+      select: false,
     },
     role: {
       type: String,
@@ -46,13 +34,24 @@ const userSchema = new mongoose.Schema(
     },
     nicNumber: {
       type: String,
+      required: true,
       unique: true,
-      sparse: true,
       set: normalizeNicNumber,
     },
-    mustChangePassword: {
-      type: Boolean,
-      default: false,
+    signupOtpHash: {
+      type: String,
+      required: true,
+      select: false,
+    },
+    signupOtpExpiresAt: {
+      type: Date,
+      required: true,
+      select: false,
+    },
+    signupOtpSentAt: {
+      type: Date,
+      required: true,
+      select: false,
     },
   },
   {
@@ -60,6 +59,6 @@ const userSchema = new mongoose.Schema(
   }
 );
 
-const User = mongoose.model("User", userSchema);
+const PendingSignup = mongoose.model("PendingSignup", pendingSignupSchema);
 
-export default User;
+export default PendingSignup;

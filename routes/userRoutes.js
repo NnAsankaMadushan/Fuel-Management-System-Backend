@@ -1,7 +1,11 @@
 import express from "express";
 import {
   signupUser,
+  resendSignupOtp,
+  confirmSignupUser,
   createStationOwnerByAdmin,
+  requestEmailVerificationOtp,
+  verifyEmailVerificationOtp,
   loginUser,
   logoutUser,
   updateUser,
@@ -16,6 +20,10 @@ const router = express.Router();
 router.get("/profile/:username", getUserProfile);
 router.get("/me", protectRoute, getCurrentUser);
 router.post("/signup", signupUser);
+router.post("/signup/resend-otp", resendSignupOtp);
+router.post("/signup/confirm", confirmSignupUser);
+router.post("/email-verification/request-otp", requestEmailVerificationOtp);
+router.post("/email-verification/verify-otp", verifyEmailVerificationOtp);
 router.post("/admin/station-owners", protectRoute, authorizeAdmin, createStationOwnerByAdmin);
 router.post("/login", loginUser);
 router.post("/logout", logoutUser);
