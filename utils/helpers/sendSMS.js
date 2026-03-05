@@ -1,7 +1,6 @@
 import axios from 'axios';
 
 /**
- * Send an SMS using send.lk
  * @param {string} to - The recipient's phone number
  * @param {string} message - The message body
  */
