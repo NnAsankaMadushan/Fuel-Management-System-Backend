@@ -1,6 +1,14 @@
+import mongoose from "mongoose";
+import Notification from "../models/notification.js";
+
 const getMyNotifications = async (req, res) => {
   try {
-    res.status(200).json([]);
+    const notifications = await Notification.find({ user: req.user._id })
+      .populate("vehicle", "vehicleNumber")
+      .sort({ createdAt: -1 })
+      .limit(200);
+
+    res.status(200).json(notifications);
   } catch (error) {
     res.status(500).json({ message: error.message });
     console.log("Error in getMyNotifications: ", error.message);
@@ -9,12 +17,27 @@ const getMyNotifications = async (req, res) => {
 
 const markNotificationAsRead = async (req, res) => {
   try {
+    const notificationId = String(req.params.id || "").trim();
+
+    if (!mongoose.Types.ObjectId.isValid(notificationId)) {
+      res.status(400).json({ message: "Invalid notification ID" });
+      return;
+    }
+
+    const notification = await Notification.findOneAndUpdate(
+      { _id: notificationId, user: req.user._id },
+      { $set: { isRead: true } },
+      { new: true }
+    ).populate("vehicle", "vehicleNumber");
+
+    if (!notification) {
+      res.status(404).json({ message: "Notification not found" });
+      return;
+    }
+
     res.status(200).json({
-      message: "Notifications are managed locally on the client",
-      notification: {
-        _id: String(req.params.id || "").trim(),
-        isRead: true,
-      },
+      message: "Notification marked as read",
+      notification,
     });
   } catch (error) {
     res.status(500).json({ message: "Failed to mark notification as read" });
@@ -24,9 +47,14 @@ const markNotificationAsRead = async (req, res) => {
 
 const markAllMyNotificationsAsRead = async (req, res) => {
   try {
+    const result = await Notification.updateMany(
+      { user: req.user._id, isRead: false },
+      { $set: { isRead: true } }
+    );
+
     res.status(200).json({
-      message: "Notifications are managed locally on the client",
-      modifiedCount: 0,
+      message: "Notifications marked as read",
+      modifiedCount: Number(result?.modifiedCount || 0),
     });
   } catch (error) {
     res.status(500).json({ message: "Failed to mark notifications as read" });

@@ -4,6 +4,7 @@ import {
   updateStation,
   getStationById,
   getAllStations,
+  reviewStationRegistration,
   addStationOperator,
   deleteStationOperator,
   deleteStation,
@@ -22,6 +23,7 @@ router.get("/getAllStationOperators", protectRoute, getAllStationOperators);
 router.get("/getAllStaionsByUserId", protectRoute, getAllStaionsByUserId);
 router.delete("/deleteStationOperator/:id", protectRoute, deleteStationOperator);
 router.delete("/deleteStation/:id", protectRoute, authorizeAdmin, deleteStation);  // Authorized users can delete station details
+router.patch("/:id/approval", protectRoute, authorizeAdmin, reviewStationRegistration);
 router.get("/:id", protectRoute, getStationById);  // Authorized users can get station details by ID
 router.get("/", protectRoute, getAllStations);  // Authorized users can get all station details
 

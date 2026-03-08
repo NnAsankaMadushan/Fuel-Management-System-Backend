@@ -2,6 +2,13 @@ import FuelStation from "../models/fuelStation.js";
 import User from "../models/user.js";
 import bcrypt from "bcryptjs";
 import { normalizeNicNumber } from "../utils/helpers/normalizeNicNumber.js";
+import { issueEmailVerificationOtp } from "../utils/helpers/emailVerificationOtp.js";
+import {
+  STATION_VERIFICATION_STATUSES,
+  getStationVerificationStatus,
+  isStationApproved,
+} from "../utils/helpers/stationApproval.js";
+import { sendUserNotification } from "../utils/helpers/sendUserNotification.js";
 
 // import { protectRoute, authorizeRole } from "../middleware/protectRoute.js"; // Import protectRoute and authorizeRole middleware
 
@@ -28,6 +35,40 @@ const normalizeOptionalText = (value) => {
   const trimmedValue = value.trim();
   return trimmedValue || undefined;
 };
+
+const normalizeApprovalNote = (value = "") => String(value || "").trim();
+
+const getOwnedStations = (userId) => FuelStation.find({ fuelStationOwner: userId });
+
+const mapStationResponse = (station) => ({
+  _id: station._id,
+  fuelStationOwner: station.fuelStationOwner
+    ? {
+        _id: station.fuelStationOwner?._id || station.fuelStationOwner,
+        name: station.fuelStationOwner?.name,
+        email: station.fuelStationOwner?.email,
+      }
+    : null,
+  stationName: station.stationName,
+  location: station.location,
+  station_regNumber: station.station_regNumber,
+  availablePetrol: Number(station.availablePetrol || 0),
+  availableDiesel: Number(station.availableDiesel || 0),
+  registeredVehicles: station.registeredVehicles || [],
+  stationOperators: station.stationOperators || [],
+  isVerified: isStationApproved(station),
+  verificationStatus: getStationVerificationStatus(station),
+  approvalNote: station.approvalNote || "",
+  reviewedAt: station.reviewedAt,
+  reviewedBy: station.reviewedBy
+    ? {
+        _id: station.reviewedBy?._id || station.reviewedBy,
+        name: station.reviewedBy?.name,
+      }
+    : null,
+  createdAt: station.createdAt,
+  updatedAt: station.updatedAt,
+});
 
 // Signup a new fuel station
 const registerStation = async (req, res) => {
@@ -68,6 +109,9 @@ const registerStation = async (req, res) => {
       stationName,
       location,
       station_regNumber,
+      isVerified: false,
+      verificationStatus: "pending",
+      approvalNote: "Waiting for admin approval.",
       availablePetrol: availablePetrol ?? 0,
       availableDiesel: availableDiesel ?? 0,
     });
@@ -75,13 +119,8 @@ const registerStation = async (req, res) => {
     await newStation.save();
 
     res.status(201).json({
-      _id: newStation._id,
-      stationName: newStation.stationName,
-      stationOwner: newStation.fuelStationOwner,
-      location: newStation.location,
-      station_regNumber: newStation.station_regNumber,
-      availablePetrol: newStation.availablePetrol,
-      availableDiesel: newStation.availableDiesel,
+      ...mapStationResponse(newStation),
+      message: "Station registered successfully and is pending admin approval.",
     });
   } catch (error) {
     res.status(error.statusCode || 500).json({ message: error.message });
@@ -121,6 +160,16 @@ const updateStation = async (req, res) => {
         .json({ message: "You are not authorized to update this station" });
     }
 
+    if (
+      (availablePetrol !== undefined || availableDiesel !== undefined) &&
+      !isStationApproved(station)
+    ) {
+      return res.status(403).json({
+        message:
+          "Station must be approved by admin before fuel stock can be updated",
+      });
+    }
+
     // Update station details
     if (stationName) {
       station.stationName = stationName;
@@ -142,15 +191,7 @@ const updateStation = async (req, res) => {
     station = await station.save();
 
     res.status(200).json({
-      station: {
-        _id: station._id,
-        stationName: station.stationName,
-        stationOwner: station.fuelStationOwner,
-        location: station.location,
-        station_regNumber: station.station_regNumber,
-        availablePetrol: station.availablePetrol,
-        availableDiesel: station.availableDiesel,
-      },
+      station: mapStationResponse(station),
       message: "Station updated successfully",
     });
   } catch (error) {
@@ -166,13 +207,14 @@ const getStationById = async (req, res) => {
   try {
     const station = await FuelStation.findById(stationId)
       .populate("fuelStationOwner", "name email")
+      .populate("reviewedBy", "name")
       .populate("stationOperators", "name email phoneNumber nicNumber role")
       .populate(`registeredVehicles.vehicle`, "vehicleNumber vehicleType");
     if (!station) {
       return res.status(404).json({ message: "Station not found" });
     }
 
-    res.status(200).json(station);
+    res.status(200).json(mapStationResponse(station));
   } catch (error) {
     res.status(500).json({ message: error.message });
     console.log("Error in getStationById: ", error.message);
@@ -185,12 +227,107 @@ const getAllStations = async (req, res) => {
     const stations = await FuelStation.find({})
       .sort({ createdAt: -1, _id: -1 })
       .populate("fuelStationOwner", "name email")
+      .populate("reviewedBy", "name")
       .populate("stationOperators", "name email phoneNumber nicNumber role")
       .populate(`registeredVehicles.vehicle`, "vehicleNumber vehicleType");
-    res.status(200).json(stations);
+    res.status(200).json(stations.map(mapStationResponse));
   } catch (error) {
     res.status(500).json({ message: error.message });
     console.log("Error in getAllStations: ", error.message);
+  }
+};
+
+const reviewStationRegistration = async (req, res) => {
+  try {
+    const status = String(req.body.status || "")
+      .trim()
+      .toLowerCase();
+    const approvalNote = normalizeApprovalNote(req.body.note);
+
+    if (!STATION_VERIFICATION_STATUSES.includes(status) || status === "pending") {
+      res.status(400).json({ message: "Status must be approved or rejected" });
+      return;
+    }
+
+    const station = await FuelStation.findById(req.params.id).populate(
+      "fuelStationOwner",
+      "name email"
+    );
+
+    if (!station) {
+      res.status(404).json({ message: "Station not found" });
+      return;
+    }
+
+    const currentStatus = getStationVerificationStatus(station);
+    const nextNote =
+      approvalNote ||
+      (status === "approved"
+        ? "Station approved by admin review."
+        : "Station rejected by admin review.");
+
+    if (currentStatus === status && (station.approvalNote || "") === nextNote) {
+      const responseStation = await FuelStation.findById(station._id)
+        .populate("fuelStationOwner", "name email")
+        .populate("reviewedBy", "name")
+        .populate("stationOperators", "name email phoneNumber nicNumber role")
+        .populate(`registeredVehicles.vehicle`, "vehicleNumber vehicleType");
+
+      res.status(200).json({
+        message: `Station is already ${status}.`,
+        station: mapStationResponse(responseStation),
+      });
+      return;
+    }
+
+    station.verificationStatus = status;
+    station.isVerified = status === "approved";
+    station.approvalNote = nextNote;
+    station.reviewedAt = new Date();
+    station.reviewedBy = req.user._id;
+    await station.save();
+
+    try {
+      const notificationTitle =
+        status === "approved"
+          ? "Station registration approved"
+          : "Station registration rejected";
+      const notificationMessage =
+        status === "approved"
+          ? `Your station ${station.stationName} has been approved. Fuel stock updates and operator management are now available.`
+          : `Your station ${station.stationName} was rejected. ${nextNote}`;
+
+      await sendUserNotification({
+        userId: station.fuelStationOwner?._id || station.fuelStationOwner,
+        title: notificationTitle,
+        message: notificationMessage,
+        type: "system_alert",
+        status,
+        targetPath: "/s-home",
+      });
+    } catch (notificationError) {
+      console.log(
+        "Error sending station approval notification:",
+        notificationError?.message || notificationError
+      );
+    }
+
+    const reviewedStation = await FuelStation.findById(station._id)
+      .populate("fuelStationOwner", "name email")
+      .populate("reviewedBy", "name")
+      .populate("stationOperators", "name email phoneNumber nicNumber role")
+      .populate(`registeredVehicles.vehicle`, "vehicleNumber vehicleType");
+
+    res.status(200).json({
+      message:
+        status === "approved"
+          ? "Station approved successfully"
+          : "Station rejected successfully",
+      station: mapStationResponse(reviewedStation),
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+    console.log("Error in reviewStationRegistration: ", error.message);
   }
 };
 
@@ -214,6 +351,20 @@ const addStationOperator = async (req, res) => {
         .json({ message: "You are not authorized to add a station operator" });
     }
 
+    const ownedStations = await getOwnedStations(user._id);
+    const fuelStation = ownedStations.find(isStationApproved);
+
+    if (ownedStations.length === 0) {
+      return res.status(404).json({ message: "Station not found" });
+    }
+
+    if (!isStationApproved(fuelStation)) {
+      return res.status(403).json({
+        message:
+          "Station must be approved by admin before operator accounts can be created",
+      });
+    }
+
     const existing = await User.findOne({ email });
     if (existing) {
       return res.status(400).json({ message: "User already exists" });
@@ -233,22 +384,17 @@ const addStationOperator = async (req, res) => {
       role,
       phoneNumber,
       nicNumber,
-      emailVerified: true,
+      emailVerified: false,
       mustChangePassword: true,
     });
 
     await newOperator.save();
 
-    const fuelStation = await FuelStation.findOne({
-      fuelStationOwner: user._id,
-    });
-
-    if (!fuelStation) {
-      return res.status(404).json({ message: "Station not found" });
-    }
-
     fuelStation.stationOperators.push(newOperator._id);
     await fuelStation.save();
+    const otpDispatchResult = await issueEmailVerificationOtp(newOperator, {
+      enforceCooldown: false,
+    });
 
     if (newOperator) {
       res.status(201).json({
@@ -260,8 +406,13 @@ const addStationOperator = async (req, res) => {
         nicNumber: newOperator.nicNumber,
         mustChangePassword: newOperator.mustChangePassword,
         emailVerified: Boolean(newOperator.emailVerified),
-        message:
-          "Operator account created successfully. The user must change the temporary password on first login.",
+        otpDeliveryStatus: otpDispatchResult.sent ? "sent" : "failed",
+        message: otpDispatchResult.sent
+          ? "Operator account created successfully. Verification OTP has been sent to the user's email. The user must verify email and then change the temporary password on first login."
+          : "Operator account created successfully, but OTP email delivery failed. Request another OTP before first login.",
+        ...(otpDispatchResult.debugOtp
+          ? { debugOtp: otpDispatchResult.debugOtp }
+          : {}),
       });
     } else {
       res.status(400).json({ message: "Invalid user data" });
@@ -297,9 +448,10 @@ const deleteStationOperator = async (req, res) => {
 
     await operator.remove();
 
-    const fuelStation = await FuelStation.findOne({
-      fuelStationOwner: user._id,
-    });
+    const ownedStations = await getOwnedStations(user._id);
+    const fuelStation = ownedStations.find((station) =>
+      station.stationOperators.some((operatorId) => operatorId.equals(operator._id))
+    );
 
     if (!fuelStation) {
       return res.status(404).json({ message: "Station not found" });
@@ -321,17 +473,27 @@ const deleteStationOperator = async (req, res) => {
 const getAllStationOperators = async (req, res) => {
   try {
     const user = req.user;
-    const fuelStation = await FuelStation.findOne({
-      fuelStationOwner: user._id,
-    });
-
-    if (!fuelStation) {
+    const ownedStations = await getOwnedStations(user._id);
+    if (ownedStations.length === 0) {
       return res.status(404).json({ message: "Station not found" });
+    }
+
+    const operatorIds = [
+      ...new Set(
+        ownedStations.flatMap((station) =>
+          (station.stationOperators || []).map((operatorId) => operatorId.toString())
+        )
+      ),
+    ];
+
+    if (operatorIds.length === 0) {
+      res.status(200).json([]);
+      return;
     }
 
     // exclude password field, createdAt, updatedAt
     const operators = await User.find(
-      { _id: { $in: fuelStation.stationOperators } },
+      { _id: { $in: operatorIds } },
       "-password -createdAt -__v"
     )
     res.status(200).json(operators);
@@ -365,9 +527,10 @@ const getAllStaionsByUserId = async (req, res) => {
     const user = req.user;
     const stations = await FuelStation.find({ fuelStationOwner: user._id })
       .populate("fuelStationOwner", "name email")
+      .populate("reviewedBy", "name")
       .populate("stationOperators", "name email phoneNumber nicNumber role")
       .populate(`registeredVehicles.vehicle`, "vehicleNumber vehicleType");
-    res.status(200).json(stations);
+    res.status(200).json(stations.map(mapStationResponse));
   } catch (error) {
     res.status(500).json({ message: error.message });
     console.log("Error in getAllStaionsByUserId: ", error.message);
@@ -380,6 +543,7 @@ export {
   updateStation,
   getStationById,
   getAllStations,
+  reviewStationRegistration,
   addStationOperator,
   deleteStationOperator,
   deleteStation,

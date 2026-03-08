@@ -1,5 +1,4 @@
 import bcrypt from "bcryptjs";
-import crypto from "crypto";
 import User from "../models/user.js";
 import PendingSignup from "../models/pendingSignup.js";
 import {
@@ -15,56 +14,60 @@ import {
 } from "../utils/helpers/normalizeUserRole.js";
 import { normalizeNicNumber } from "../utils/helpers/normalizeNicNumber.js";
 import sendEmail from "../utils/helpers/sendEmail.js";
-
-const EMAIL_OTP_EXPIRY_MINUTES = 10;
-const EMAIL_OTP_RESEND_COOLDOWN_SECONDS = 60;
-const EMAIL_OTP_REGEX = /^[0-9]{6}$/;
+import triggerAccountCreatedWebhook from "../utils/helpers/sendN8nWebhook.js";
+import {
+  EMAIL_OTP_EXPIRY_MINUTES,
+  EMAIL_OTP_RESEND_COOLDOWN_SECONDS,
+  EMAIL_OTP_REGEX,
+  isEmailOtpDebugEnabled,
+  generateEmailVerificationOtp,
+  hashEmailVerificationOtp,
+  getOtpRetryAfterSeconds,
+  issueEmailVerificationOtp,
+} from "../utils/helpers/emailVerificationOtp.js";
 
 const isMobileClient = (req) => req.get("X-Client-Platform") === "mobile";
-const isEmailOtpDebugEnabled = () =>
-  process.env.EMAIL_OTP_DEBUG === "true" &&
-  process.env.NODE_ENV !== "production";
+const EXPO_PUSH_TOKEN_REGEX =
+  /^(ExponentPushToken|ExpoPushToken)\[[A-Za-z0-9_-]+\]$/;
+const WEB_PUSH_MAX_SUBSCRIPTIONS = 10;
 
-const generateEmailVerificationOtp = () =>
-  crypto.randomInt(100000, 1000000).toString();
+const getWebPushVapidPublicKey = () =>
+  String(process.env.WEB_PUSH_VAPID_PUBLIC_KEY || "").trim();
 
-const hashEmailVerificationOtp = (otp) =>
-  crypto.createHash("sha256").update(String(otp)).digest("hex");
+const getWebPushConfigState = () => {
+  const vapidPublicKey = getWebPushVapidPublicKey();
+  const vapidPrivateKey = String(process.env.WEB_PUSH_VAPID_PRIVATE_KEY || "").trim();
+  const vapidSubject = String(process.env.WEB_PUSH_VAPID_SUBJECT || "").trim();
 
-const getOtpRetryAfterSeconds = (sentAt) => {
-  if (!sentAt) {
-    return 0;
-  }
-
-  const elapsedSeconds = Math.floor(
-    (Date.now() - new Date(sentAt).getTime()) / 1000
-  );
-
-  return Math.max(0, EMAIL_OTP_RESEND_COOLDOWN_SECONDS - elapsedSeconds);
+  return {
+    enabled: Boolean(vapidPublicKey && vapidPrivateKey && vapidSubject),
+    vapidPublicKey: vapidPublicKey || null,
+  };
 };
 
-const buildEmailVerificationContent = (otp, recipientName = "") => {
-  const greeting = recipientName ? `Hi ${recipientName},` : "Hi,";
-  const subject = "FuelPlus Email Verification OTP";
-  const text = `${greeting}
-Use the OTP below to verify your FuelPlus account:
+const normalizeWebPushSubscriptionInput = (payload = {}) => {
+  const endpoint = String(payload?.endpoint || "").trim();
+  const p256dh = String(payload?.keys?.p256dh || "").trim();
+  const auth = String(payload?.keys?.auth || "").trim();
+  const incomingExpiration = payload?.expirationTime;
+  const parsedExpiration = Number(incomingExpiration);
 
-${otp}
+  if (!endpoint || !p256dh || !auth) {
+    return null;
+  }
 
-This OTP will expire in ${EMAIL_OTP_EXPIRY_MINUTES} minutes.
-If you did not request this, please ignore this email.`;
-
-  const html = `
-    <div style="font-family: Arial, sans-serif; line-height: 1.5; color: #1f2937;">
-      <p>${greeting}</p>
-      <p>Use the OTP below to verify your FuelPlus account:</p>
-      <p style="font-size: 24px; font-weight: 700; letter-spacing: 4px; margin: 16px 0;">${otp}</p>
-      <p>This OTP will expire in ${EMAIL_OTP_EXPIRY_MINUTES} minutes.</p>
-      <p>If you did not request this, please ignore this email.</p>
-    </div>
-  `;
-
-  return { subject, text, html };
+  return {
+    endpoint,
+    keys: { p256dh, auth },
+    expirationTime:
+      incomingExpiration === null ||
+      incomingExpiration === undefined ||
+      incomingExpiration === ""
+        ? null
+        : Number.isFinite(parsedExpiration)
+          ? parsedExpiration
+          : null,
+  };
 };
 
 const buildSignupOtpContent = (otp, recipientName = "") => {
@@ -113,40 +116,6 @@ const issueSignupOtp = async (pendingSignup, { enforceCooldown = true } = {}) =>
   const emailContent = buildSignupOtpContent(otp, pendingSignup.name);
   const emailResult = await sendEmail({
     to: pendingSignup.email,
-    ...emailContent,
-  });
-
-  return {
-    sent: Boolean(emailResult?.delivered),
-    throttled: false,
-    retryAfterSeconds: EMAIL_OTP_RESEND_COOLDOWN_SECONDS,
-    debugOtp: isEmailOtpDebugEnabled() ? otp : undefined,
-    deliveryReason: emailResult?.reason || "",
-  };
-};
-
-const issueEmailVerificationOtp = async (user, { enforceCooldown = true } = {}) => {
-  const retryAfterSeconds = getOtpRetryAfterSeconds(user.emailVerificationOtpSentAt);
-
-  if (enforceCooldown && retryAfterSeconds > 0) {
-    return {
-      sent: false,
-      throttled: true,
-      retryAfterSeconds,
-    };
-  }
-
-  const otp = generateEmailVerificationOtp();
-  const expiresAt = new Date(Date.now() + EMAIL_OTP_EXPIRY_MINUTES * 60 * 1000);
-
-  user.emailVerificationOtpHash = hashEmailVerificationOtp(otp);
-  user.emailVerificationOtpExpiresAt = expiresAt;
-  user.emailVerificationOtpSentAt = new Date();
-  await user.save();
-
-  const emailContent = buildEmailVerificationContent(otp, user.name);
-  const emailResult = await sendEmail({
-    to: user.email,
     ...emailContent,
   });
 
@@ -426,10 +395,15 @@ const confirmSignupUser = async (req, res) => {
     await newUser.save();
     await PendingSignup.deleteOne({ _id: pendingSignup._id });
 
+    const n8nDispatchResult = await triggerAccountCreatedWebhook(newUser);
+
     res.status(201).json({
       message: "Email verified successfully. Account created. You can now log in.",
       emailVerified: true,
       email: newUser.email,
+      accountCreatedEmailTriggerStatus: n8nDispatchResult.delivered
+        ? "sent_to_n8n"
+        : "n8n_failed",
     });
   } catch (error) {
     if (error?.code === 11000 && error?.keyPattern?.nicNumber) {
@@ -486,11 +460,14 @@ const createStationOwnerByAdmin = async (req, res) => {
       role,
       phoneNumber,
       nicNumber,
-      emailVerified: true,
+      emailVerified: false,
       mustChangePassword: true,
     });
 
     await newUser.save();
+    const otpDispatchResult = await issueEmailVerificationOtp(newUser, {
+      enforceCooldown: false,
+    });
 
     res.status(201).json({
       _id: newUser._id,
@@ -501,8 +478,13 @@ const createStationOwnerByAdmin = async (req, res) => {
       nicNumber: newUser.nicNumber,
       mustChangePassword: newUser.mustChangePassword,
       emailVerified: Boolean(newUser.emailVerified),
-      message:
-        "Station owner account created successfully. The user must change the temporary password on first login.",
+      otpDeliveryStatus: otpDispatchResult.sent ? "sent" : "failed",
+      message: otpDispatchResult.sent
+        ? "Station owner account created successfully. Verification OTP has been sent to the user's email. The user must verify email and then change the temporary password on first login."
+        : "Station owner account created successfully, but OTP email delivery failed. Request another OTP before first login.",
+      ...(otpDispatchResult.debugOtp
+        ? { debugOtp: otpDispatchResult.debugOtp }
+        : {}),
     });
   } catch (error) {
     if (error?.code === 11000 && error?.keyPattern?.nicNumber) {
@@ -815,6 +797,174 @@ const getCurrentUser = async (req, res) => {
   }
 };
 
+const registerPushToken = async (req, res) => {
+  try {
+    const token = String(req.body?.token || "").trim();
+
+    if (!token) {
+      res.status(400).json({ message: "Push token is required" });
+      return;
+    }
+
+    if (!EXPO_PUSH_TOKEN_REGEX.test(token)) {
+      res.status(400).json({ message: "Invalid Expo push token" });
+      return;
+    }
+
+    const user = await User.findById(req.user._id);
+
+    if (!user) {
+      res.status(404).json({ message: "User not found" });
+      return;
+    }
+
+    const existingTokens = Array.isArray(user.pushTokens)
+      ? user.pushTokens.map((entry) => String(entry || "").trim()).filter(Boolean)
+      : [];
+    const nextTokens = [token, ...existingTokens.filter((entry) => entry !== token)].slice(0, 5);
+
+    user.pushTokens = nextTokens;
+    await user.save();
+
+    res.status(200).json({
+      message: "Push token saved",
+      tokenCount: nextTokens.length,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+    console.log("Error in registerPushToken: ", error.message);
+  }
+};
+
+const getWebPushPublicConfig = async (_req, res) => {
+  try {
+    const { enabled, vapidPublicKey } = getWebPushConfigState();
+    res.status(200).json({
+      enabled,
+      vapidPublicKey,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+    console.log("Error in getWebPushPublicConfig: ", error.message);
+  }
+};
+
+const registerWebPushSubscription = async (req, res) => {
+  try {
+    const { enabled } = getWebPushConfigState();
+
+    if (!enabled) {
+      res.status(503).json({ message: "Web push is not configured on the server" });
+      return;
+    }
+
+    const incomingPayload =
+      typeof req.body?.subscription === "object" && req.body?.subscription
+        ? req.body.subscription
+        : req.body;
+    const subscription = normalizeWebPushSubscriptionInput(incomingPayload);
+
+    if (!subscription) {
+      res.status(400).json({ message: "Invalid web push subscription payload" });
+      return;
+    }
+
+    const user = await User.findById(req.user._id);
+
+    if (!user) {
+      res.status(404).json({ message: "User not found" });
+      return;
+    }
+
+    const userAgent = String(req.get("user-agent") || "").trim().slice(0, 512);
+    const currentSubscriptions = Array.isArray(user.webPushSubscriptions)
+      ? user.webPushSubscriptions
+      : [];
+    const now = new Date();
+    const existingEntry = currentSubscriptions.find(
+      (entry) => String(entry?.endpoint || "").trim() === subscription.endpoint
+    );
+    const nextEntry = {
+      ...subscription,
+      userAgent,
+      createdAt: existingEntry?.createdAt || now,
+      updatedAt: now,
+    };
+
+    const dedupedSubscriptions = currentSubscriptions.filter(
+      (entry) => String(entry?.endpoint || "").trim() !== subscription.endpoint
+    );
+
+    user.webPushSubscriptions = [nextEntry, ...dedupedSubscriptions].slice(
+      0,
+      WEB_PUSH_MAX_SUBSCRIPTIONS
+    );
+
+    await User.updateMany(
+      {
+        _id: { $ne: user._id },
+        "webPushSubscriptions.endpoint": subscription.endpoint,
+      },
+      { $pull: { webPushSubscriptions: { endpoint: subscription.endpoint } } }
+    );
+
+    await user.save();
+
+    res.status(200).json({
+      message: "Web push subscription saved",
+      subscriptionCount: user.webPushSubscriptions.length,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+    console.log("Error in registerWebPushSubscription: ", error.message);
+  }
+};
+
+const unregisterWebPushSubscription = async (req, res) => {
+  try {
+    const incomingPayload =
+      typeof req.body?.subscription === "object" && req.body?.subscription
+        ? req.body.subscription
+        : req.body;
+    const endpoint = String(incomingPayload?.endpoint || "").trim();
+
+    if (!endpoint) {
+      res.status(400).json({ message: "Subscription endpoint is required" });
+      return;
+    }
+
+    const user = await User.findById(req.user._id);
+
+    if (!user) {
+      res.status(404).json({ message: "User not found" });
+      return;
+    }
+
+    const currentSubscriptions = Array.isArray(user.webPushSubscriptions)
+      ? user.webPushSubscriptions
+      : [];
+    const nextSubscriptions = currentSubscriptions.filter(
+      (entry) => String(entry?.endpoint || "").trim() !== endpoint
+    );
+    const removedCount = currentSubscriptions.length - nextSubscriptions.length;
+
+    user.webPushSubscriptions = nextSubscriptions;
+    await user.save();
+
+    res.status(200).json({
+      message:
+        removedCount > 0
+          ? "Web push subscription removed"
+          : "Web push subscription was already removed",
+      removedCount,
+      subscriptionCount: nextSubscriptions.length,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+    console.log("Error in unregisterWebPushSubscription: ", error.message);
+  }
+};
+
 const requestEmailVerificationOtp = async (req, res) => {
   try {
     const email = String(req.body?.email || "").trim();
@@ -954,4 +1104,8 @@ export {
   changePassword,
   getUserProfile,
   getCurrentUser,
+  registerPushToken,
+  getWebPushPublicConfig,
+  registerWebPushSubscription,
+  unregisterWebPushSubscription,
 };

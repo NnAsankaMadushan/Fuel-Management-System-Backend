@@ -15,8 +15,8 @@ const notificationSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["vehicle_approval", "fuel_transaction"],
-      default: "vehicle_approval",
+      enum: ["vehicle_approval", "fuel_transaction", "account_event", "system_alert"],
+      default: "system_alert",
     },
     title: {
       type: String,

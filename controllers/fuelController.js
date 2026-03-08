@@ -7,6 +7,26 @@ import mongoose from "mongoose";
 import sendSMS from "../utils/helpers/sendSMS.js";
 import normalizeVehicleNumber from "../utils/helpers/normalizeVehicleNumber.js";
 import { isVehicleApproved } from "../utils/helpers/vehicleApproval.js";
+import { isStationApproved } from "../utils/helpers/stationApproval.js";
+import { triggerFuelDispensedWebhook } from "../utils/helpers/sendN8nWebhook.js";
+
+const REPORT_TIME_ZONE = process.env.CRON_TIMEZONE || "Asia/Colombo";
+
+const getDateKeyInTimeZone = (value, timeZone = REPORT_TIME_ZONE) => {
+  const date = value instanceof Date ? value : new Date(value);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+
+  return `${year}-${month}-${day}`;
+};
 
 const buildRecentDays = (days = 7) => {
   const entries = [];
@@ -18,7 +38,7 @@ const buildRecentDays = (days = 7) => {
     const current = new Date(start);
     current.setDate(start.getDate() + index);
     entries.push({
-      key: current.toISOString().slice(0, 10),
+      key: getDateKeyInTimeZone(current),
       label: current.toLocaleDateString("en-US", { weekday: "short" }),
     });
   }
@@ -28,11 +48,13 @@ const buildRecentDays = (days = 7) => {
 
 const getScopedStations = async (user) => {
   if (user.role === "station_owner") {
-    return FuelStation.find({ fuelStationOwner: user._id });
+    const stations = await FuelStation.find({ fuelStationOwner: user._id });
+    return stations.filter(isStationApproved);
   }
 
   if (user.role === "station_operator") {
-    return FuelStation.find({ stationOperators: user._id });
+    const stations = await FuelStation.find({ stationOperators: user._id });
+    return stations.filter(isStationApproved);
   }
 
   return [];
@@ -136,15 +158,16 @@ export const registerFuelTransaction = async (req, res) => {
       return;
     }
 
-    const stationQuery =
-      req.user.role === "station_owner"
-        ? { fuelStationOwner: req.user._id }
-        : { stationOperators: req.user._id };
+    const scopedStations = await getScopedStations(req.user);
+    const scopedStationIds = scopedStations.map((station) => station._id.toString());
+    const fuelStation = scopedStationIds.length
+      ? await FuelStation.findOne({ _id: { $in: scopedStationIds } }).session(session)
+      : null;
 
-    // Find the fuel station where the authenticated station user is assigned
-    const fuelStation = await FuelStation.findOne(stationQuery).session(session);
     if (!fuelStation) {
-      await abortWithResponse(400, { message: "Fuel Station not found" });
+      await abortWithResponse(403, {
+        message: "No approved fuel station is available for transactions",
+      });
       return;
     }
 
@@ -198,6 +221,23 @@ export const registerFuelTransaction = async (req, res) => {
     const message = `Dear ${user.name}, ${pumpedLitres} litres of fuel has been pumped at ${fuelStation.stationName}. Your remaining quota is ${quotaAfter} litres.`;
     await sendSMS(user.phoneNumber, message);
 
+    const allocatedQuota = Number(fuelQuota.allocatedQuota || 0);
+    const usedQuota = allocatedQuota - quotaAfter;
+    const n8nDispatchResult = await triggerFuelDispensedWebhook({
+      user,
+      vehicle,
+      station: fuelStation,
+      transaction: newFuelTransaction,
+      quota: {
+        reducedQuota: pumpedLitres,
+        availableQuota: quotaAfter,
+        quotaBefore,
+        quotaAfter,
+        allocatedQuota,
+        usedQuota,
+      },
+    });
+
     res.status(201).json({
       _id: newFuelTransaction._id,
       vehicle: newFuelTransaction.vehicle,
@@ -211,6 +251,9 @@ export const registerFuelTransaction = async (req, res) => {
       status: newFuelTransaction.status,
       availablePetrol: fuelStation.availablePetrol,
       availableDiesel: fuelStation.availableDiesel,
+      fuelReceiptEmailTriggerStatus: n8nDispatchResult.delivered
+        ? "sent_to_n8n"
+        : "n8n_failed",
     });
   } catch (error) {
     await session.abortTransaction();
@@ -350,7 +393,7 @@ export const getStationSummary = async (req, res) => {
       : [];
 
     const totalsByDate = transactions.reduce((accumulator, transaction) => {
-      const key = transaction.createdAt.toISOString().slice(0, 10);
+      const key = getDateKeyInTimeZone(transaction.createdAt);
       accumulator[key] = (accumulator[key] || 0) + transaction.litresPumped;
       return accumulator;
     }, {});

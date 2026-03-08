@@ -2,6 +2,44 @@ import mongoose from "mongoose";
 import { normalizeUserRole, USER_ROLES } from "../utils/helpers/normalizeUserRole.js";
 import { normalizeNicNumber } from "../utils/helpers/normalizeNicNumber.js";
 
+const webPushSubscriptionSchema = new mongoose.Schema(
+  {
+    endpoint: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    expirationTime: {
+      type: Number,
+      default: null,
+    },
+    keys: {
+      p256dh: {
+        type: String,
+        required: true,
+      },
+      auth: {
+        type: String,
+        required: true,
+      },
+    },
+    userAgent: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now,
+    },
+    updatedAt: {
+      type: Date,
+      default: Date.now,
+    },
+  },
+  { _id: false }
+);
+
 const userSchema = new mongoose.Schema(
   {
     name: {
@@ -53,6 +91,14 @@ const userSchema = new mongoose.Schema(
     mustChangePassword: {
       type: Boolean,
       default: false,
+    },
+    pushTokens: {
+      type: [String],
+      default: [],
+    },
+    webPushSubscriptions: {
+      type: [webPushSubscriptionSchema],
+      default: [],
     },
   },
   {

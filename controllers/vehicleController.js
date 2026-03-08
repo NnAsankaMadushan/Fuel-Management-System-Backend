@@ -10,6 +10,7 @@ import {
   getVehicleVerificationStatus,
   isVehicleApproved,
 } from "../utils/helpers/vehicleApproval.js";
+import { sendUserNotification } from "../utils/helpers/sendUserNotification.js";
 
 const VEHICLE_TYPE_ALIASES = {
   motorcycle: "bike",
@@ -19,6 +20,11 @@ const VEHICLE_TYPE_ALIASES = {
 const ALLOWED_VEHICLE_TYPES = ["car", "bike", "truck", "bus"];
 const ALLOWED_FUEL_TYPES = ["petrol", "diesel"];
 const REVIEWABLE_STATUSES = ["approved", "rejected"];
+const SELF_SERVICE_VEHICLE_ROLES = new Set([
+  "vehicle_owner",
+  "station_owner",
+  "station_operator",
+]);
 
 const QUOTA_BY_VEHICLE_TYPE = {
   car: 20,
@@ -336,6 +342,31 @@ const reviewVehicleRegistration = async (req, res) => {
       { $set: { Verified: status === "approved" } }
     );
 
+    try {
+      const notificationTitle =
+        status === "approved"
+          ? "Vehicle registration approved"
+          : "Vehicle registration rejected";
+      const notificationMessage =
+        status === "approved"
+          ? `Your vehicle ${vehicle.vehicleNumber} has been approved.`
+          : `Your vehicle ${vehicle.vehicleNumber} was rejected. ${nextNote}`;
+
+      await sendUserNotification({
+        userId: vehicle.vehicleOwner?._id || vehicle.vehicleOwner,
+        title: notificationTitle,
+        message: notificationMessage,
+        type: "vehicle_approval",
+        status,
+        vehicleId: vehicle._id,
+      });
+    } catch (notificationError) {
+      console.log(
+        "Error sending vehicle approval notification:",
+        notificationError?.message || notificationError
+      );
+    }
+
     const reviewedVehicle = await Vehicle.findById(vehicle._id)
       .populate("vehicleOwner", "name")
       .populate("reviewedBy", "name");
@@ -372,15 +403,14 @@ const deleteVehicle = async (req, res) => {
 
 const getMyVehicles = async (req, res) => {
   try {
-    if (req.user.role !== "vehicle_owner") {
+    if (!SELF_SERVICE_VEHICLE_ROLES.has(req.user.role)) {
       res.status(400).json({ message: "Unauthorized" });
       return;
     }
 
-    const vehicles = await Vehicle.find({ vehicleOwner: req.user._id }).populate(
-      "reviewedBy",
-      "name"
-    );
+    const vehicles = await Vehicle.find({ vehicleOwner: req.user._id })
+      .sort({ createdAt: -1, _id: -1 })
+      .populate("reviewedBy", "name");
 
     const vehicleDetails = await Promise.all(
       vehicles.map((vehicle) => mapVehicleWithQuota(vehicle))
